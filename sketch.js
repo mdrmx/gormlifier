@@ -12,6 +12,9 @@
 // All parameters live in the settings panel. Editing the panel changes
 // nothing on screen until the Render button is pressed: `cfg` (the settings
 // actually in use) is only replaced by render().
+//
+// Presets (see presets.js) only fill in the panel; they never render by
+// themselves, so applying one goes through the same Render path as manual edits.
 
 // ---- Model library ----
 // Models shown in the dropdown. `texture` is optional. Files dropped onto the
@@ -190,6 +193,12 @@ let progressBar = null;
 const inputs = {};
 let renderButton = null;
 let statusEl = null;
+// Presets offered in the panel. User-created presets can be appended here (same
+// shape as the built-ins) followed by refreshPresetSelect().
+let presets = [...BUILTIN_PRESETS];
+let appliedPresetId = null; // last preset applied, null after a reset
+let presetSelect = null;
+let presetPlaceholder = null; // the "Custom" / "<name> (modified)" option
 // Caches so re-rendering doesn't reload unchanged assets
 let modelCache = { path: null, geom: null };
 let imageCache = { path: null, img: null }; // the full-size p5.Image
@@ -242,6 +251,8 @@ function buildPanel() {
   panel.appendChild(body);
   // Clicking the header collapses / expands the panel.
   header.addEventListener("click", () => panel.classList.toggle("collapsed"));
+
+  buildPresetControls(body);
 
   for (const s of SETTINGS) {
     if (s.group) {
@@ -328,6 +339,7 @@ function readPanel(writeBack) {
 
 // Highlights the Render button when the panel differs from what's on screen.
 function updateDirty() {
+  updatePresetIndicator();
   const next = readPanel(false);
   const dirty = fields.some((s) => next[s.key] !== cfg[s.key]);
   renderButton.classList.toggle("dirty", dirty);
@@ -336,6 +348,97 @@ function updateDirty() {
 
 function setStatus(msg) {
   if (statusEl) statusEl.textContent = msg;
+}
+
+// ---- Presets ----
+
+// Preset dropdown (grouped) and a Reset to defaults button, at the top of the panel.
+function buildPresetControls(body) {
+  const g = document.createElement("div");
+  g.className = "panel-group";
+  g.textContent = "Presets";
+  body.appendChild(g);
+
+  const row = document.createElement("label");
+  row.className = "panel-row";
+  const text = document.createElement("span");
+  text.textContent = "Preset";
+  presetSelect = document.createElement("select");
+  presetSelect.addEventListener("change", () => {
+    if (presetSelect.value) applyPreset(presetSelect.value);
+    else updatePresetIndicator(); // "Custom" is a status, not an action
+  });
+  row.append(text, presetSelect);
+  body.appendChild(row);
+
+  const reset = document.createElement("button");
+  reset.textContent = "Reset to defaults";
+  reset.style.marginTop = "6px";
+  reset.addEventListener("click", resetToDefaults);
+  body.appendChild(reset);
+
+  refreshPresetSelect();
+}
+
+// Rebuilds the dropdown from `presets`, grouped in order of first appearance.
+function refreshPresetSelect() {
+  presetPlaceholder = document.createElement("option");
+  presetPlaceholder.value = "";
+  const groups = new Map();
+  for (const p of presets) {
+    if (!groups.has(p.group)) {
+      const el = document.createElement("optgroup");
+      el.label = p.group;
+      groups.set(p.group, el);
+    }
+    const opt = document.createElement("option");
+    opt.value = p.id;
+    opt.textContent = p.name;
+    groups.get(p.group).appendChild(opt);
+  }
+  presetSelect.replaceChildren(presetPlaceholder, ...groups.values());
+  updatePresetIndicator();
+}
+
+// Shows the last applied preset only while the panel still matches it exactly;
+// after manual edits it reads "<name> (modified)" instead.
+function updatePresetIndicator() {
+  if (!presetSelect) return;
+  const applied = presets.find((p) => p.id === appliedPresetId);
+  const exact = !!applied && settingsMatch(readPanel(false), applied);
+  presetPlaceholder.textContent =
+    applied && !exact ? `${applied.name} (modified)` : "Custom";
+  presetSelect.value = exact ? applied.id : "";
+}
+
+// Writes values into the panel inputs (keys not in `values` are left alone).
+function writePanel(values) {
+  for (const s of fields) {
+    if (!(s.key in values)) continue;
+    const input = inputs[s.key];
+    const v = values[s.key];
+    if (s.type === "bool") input.checked = v;
+    else if (s.type === "select") {
+      // Never select a model that is not in the library (e.g. an unknown id).
+      if (library.some((e) => e.id === v)) input.value = v;
+    } else input.value = v;
+  }
+}
+
+// Fills the panel from a preset. Nothing is rendered: press Render to apply it.
+function applyPreset(id) {
+  const preset = presets.find((p) => p.id === id);
+  if (!preset) return;
+  appliedPresetId = preset.id;
+  writePanel(preset.settings);
+  updateDirty();
+}
+
+// Restores the defaults declared in SETTINGS. Uploaded models stay in the library.
+function resetToDefaults() {
+  appliedPresetId = null;
+  writePanel(Object.fromEntries(fields.map((s) => [s.key, s.value])));
+  updateDirty();
 }
 
 // ---- Rendering ----
@@ -959,9 +1062,23 @@ function drawCloud(cloud) {
   gl.useProgram(null);
 }
 
+// orbitControl() pans on the right button only. With shift held, a left drag is
+// presented to it as a right drag, so shift+drag pans instead of rotating.
+function orbitOrPan() {
+  const p = p5.instance;
+  const real = p.mouseButton;
+  if (p.mouseIsPressed && keyIsDown(SHIFT) && real && real.left) {
+    p.mouseButton = { left: false, right: true, center: false };
+    orbitControl();
+    p.mouseButton = real;
+  } else {
+    orbitControl();
+  }
+}
+
 function draw() {
   background(cfg.backgroundColour);
-  orbitControl(); // mouse orbit / zoom
+  orbitOrPan(); // mouse orbit / zoom; right-drag or shift+drag pans
   // rotateY(frameCount * 0.003); // slow automatic turntable rotation
   if (!walkers.length) return; // model still loading
 
