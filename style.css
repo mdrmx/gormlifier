@@ -1,0 +1,131 @@
+html,
+body {
+  margin: 0;
+  padding: 0;
+}
+canvas {
+  display: block;
+}
+
+#settings-panel {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  width: 280px;
+  max-height: calc(100vh - 24px);
+  display: flex;
+  flex-direction: column;
+  background: rgba(30, 30, 30, 0.92);
+  color: #eee;
+  font: 12px/1.4 system-ui, sans-serif;
+  border-radius: 8px;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+  z-index: 10;
+}
+#settings-panel .panel-header {
+  padding: 10px 12px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+#settings-panel .panel-body {
+  padding: 0 12px 12px;
+  overflow-y: auto;
+}
+#settings-panel.collapsed .panel-body {
+  display: none;
+}
+#settings-panel .panel-group {
+  margin: 12px 0 4px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: #999;
+}
+#settings-panel .panel-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 4px 0;
+}
+#settings-panel .panel-row input[type="number"],
+#settings-panel .panel-row input[type="text"] {
+  width: 110px;
+  box-sizing: border-box;
+  background: #111;
+  color: #eee;
+  border: 1px solid #555;
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+#settings-panel .panel-row select {
+  width: 150px;
+  box-sizing: border-box;
+  background: #111;
+  color: #eee;
+  border: 1px solid #555;
+  border-radius: 4px;
+  padding: 3px 6px;
+}
+#settings-panel .drop-zone {
+  margin: 6px 0;
+  padding: 12px 8px;
+  border: 1px dashed #777;
+  border-radius: 6px;
+  text-align: center;
+  color: #aaa;
+  cursor: pointer;
+}
+#settings-panel .drop-zone.over {
+  border-color: #2f7de1;
+  background: rgba(47, 125, 225, 0.15);
+  color: #fff;
+}
+#settings-panel button {
+  width: 100%;
+  margin-top: 14px;
+  padding: 8px;
+  border: 0;
+  border-radius: 4px;
+  background: #555;
+  color: #fff;
+  font-weight: 600;
+  cursor: pointer;
+}
+#settings-panel button.dirty {
+  background: #2f7de1;
+}
+#settings-panel button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+#settings-panel .panel-status {
+  margin-top: 6px;
+  min-height: 1.4em;
+  color: #aaa;
+}
+
+#model-preview {
+  position: fixed;
+  left: 12px;
+  bottom: 12px;
+  background: rgba(30, 30, 30, 0.92);
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+  cursor: grab;
+  z-index: 10;
+}
+#model-preview canvas {
+  touch-action: none;
+}
+#model-preview .preview-label {
+  padding: 4px 8px;
+  color: #ccc;
+  font: 11px/1.4 system-ui, sans-serif;
+  max-width: 204px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
