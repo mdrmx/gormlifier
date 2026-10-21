@@ -32,6 +32,14 @@ const library = [
     model: "assets/source/untitled.obj",
     texture: null,
   },
+  {
+    id: "bust",
+    label: "Napoleon",
+    model:
+      "assets/napoleon/source/3D_MNK_A_810_Popiersie_Napoleona/3D_MNK_A_810_Popiersie_Napoleona.obj",
+    texture:
+      "assets/napoleon/source/3D_MNK_A_810_Popiersie_Napoleona/810_Diffuse.jpg",
+  },
 ];
 let uploadCount = 0;
 
@@ -165,17 +173,9 @@ const SETTINGS = [
     max: 20,
     step: 0.1,
   },
-  {
-    key: "progressBarWidth",
-    label: "Progress bar width (px)",
-    type: "number",
-    value: 300,
-    min: 50,
-    max: 2000,
-    step: 10,
-    int: true,
-  },
 ];
+
+const PROGRESS_BAR_WIDTH = 300; // px, width of the loading bar
 
 // ---- State ----
 const fields = SETTINGS.filter((s) => s.key);
@@ -193,9 +193,19 @@ let progressBar = null;
 const inputs = {};
 let renderButton = null;
 let statusEl = null;
-// Presets offered in the panel. User-created presets can be appended here (same
-// shape as the built-ins) followed by refreshPresetSelect().
-let presets = [...BUILTIN_PRESETS];
+// Presets offered in the panel: built-ins (with any saved overwrites) plus
+// the user's own, loaded from localStorage when available.
+const presetStorage = (() => {
+  try {
+    return window.localStorage;
+  } catch {
+    return null; // blocked or not in a browser
+  }
+})();
+let presetStore = presetStorage
+  ? readPresetStore(presetStorage)
+  : { overrides: {}, user: [] };
+let presets = buildPresets(presetStore);
 let appliedPresetId = null; // last preset applied, null after a reset
 let presetSelect = null;
 let presetPlaceholder = null; // the "Custom" / "<name> (modified)" option
@@ -221,6 +231,9 @@ const preview = {
 
 async function setup() {
   createCanvas(windowWidth, windowHeight, WEBGL);
+  drawingContext.canvas.addEventListener("wheel", onCanvasWheel, {
+    passive: true,
+  });
   buildPanel();
   buildPreview();
   // Dropping a file outside the drop box must not make the browser navigate to it.
@@ -371,9 +384,20 @@ function buildPresetControls(body) {
   row.append(text, presetSelect);
   body.appendChild(row);
 
+  const actions = document.createElement("div");
+  actions.className = "panel-buttons";
+  const save = document.createElement("button");
+  save.textContent = "Save preset";
+  save.addEventListener("click", saveNewPreset);
+  const overwrite = document.createElement("button");
+  overwrite.textContent = "Overwrite preset";
+  overwrite.addEventListener("click", overwritePreset);
+  actions.append(save, overwrite);
+  body.appendChild(actions);
+
   const reset = document.createElement("button");
+  reset.className = "secondary";
   reset.textContent = "Reset to defaults";
-  reset.style.marginTop = "6px";
   reset.addEventListener("click", resetToDefaults);
   body.appendChild(reset);
 
@@ -439,6 +463,67 @@ function resetToDefaults() {
   appliedPresetId = null;
   writePanel(Object.fromEntries(fields.map((s) => [s.key, s.value])));
   updateDirty();
+}
+
+// Validated panel values to store in a preset, or null (with a status message)
+// when they can't be saved. Uploaded models are blob: URLs that don't survive a
+// reload, so presets can only reference models from the built-in library.
+function settingsToSave() {
+  const values = readPanel(true);
+  if (values.modelId.startsWith("upload-")) {
+    setStatus("Presets can't use uploaded models");
+    return null;
+  }
+  return values;
+}
+
+// Stores `presetStore` and rebuilds the list. Returns false if storage failed
+// (the change then only lasts until the page is reloaded).
+function commitPresetStore() {
+  presets = buildPresets(presetStore);
+  refreshPresetSelect();
+  return !presetStorage || writePresetStore(presetStorage, presetStore);
+}
+
+// Saves the current panel as a new preset in the "My presets" group.
+function saveNewPreset() {
+  const values = settingsToSave();
+  if (!values) return;
+  const name = (prompt("Name for the new preset:") || "").trim();
+  if (!name) return;
+  if (presets.some((p) => p.name.toLowerCase() === name.toLowerCase())) {
+    setStatus(`A preset named "${name}" already exists`);
+    return;
+  }
+  const id = `user-${Date.now().toString(36)}-${presetStore.user.length}`;
+  presetStore.user.push({ id, name, group: USER_GROUP, settings: values });
+  appliedPresetId = id;
+  const saved = commitPresetStore();
+  updateDirty();
+  setStatus(saved ? `Saved "${name}"` : `Saved "${name}" (not persisted)`);
+}
+
+// Replaces the last applied preset's settings with the current panel values.
+// For a built-in preset only the override is stored; the original stays in code.
+function overwritePreset() {
+  const target = presets.find((p) => p.id === appliedPresetId);
+  if (!target) {
+    setStatus("Select a preset to overwrite first");
+    return;
+  }
+  const values = settingsToSave();
+  if (!values) return;
+  if (!confirm(`Overwrite "${target.name}" with the current settings?`)) return;
+  const user = presetStore.user.find((p) => p.id === target.id);
+  if (user) user.settings = values;
+  else presetStore.overrides[target.id] = values;
+  const saved = commitPresetStore();
+  updateDirty();
+  setStatus(
+    saved
+      ? `Overwrote "${target.name}"`
+      : `Overwrote "${target.name}" (not persisted)`,
+  );
 }
 
 // ---- Rendering ----
@@ -1062,10 +1147,38 @@ function drawCloud(cloud) {
   gl.useProgram(null);
 }
 
+// Wheel zoom. p5's own zoom adds a fixed kick per wheel event regardless of its
+// size, which overshoots on trackpads and fast wheels. Instead the wheel deltas
+// are summed in proportion to their size, and the camera eases toward that
+// target. Touch pinch zoom is still handled by orbitControl().
+const ZOOM_PER_PIXEL = 0.0006; // log10 of camera distance per wheel pixel
+const ZOOM_MAX_EVENT = 200; // caps one event, so a hard flick can't jump
+const ZOOM_EASE_MS = 90; // smoothing time constant
+let zoomRemaining = 0; // log10 distance change still to apply
+
+function onCanvasWheel(e) {
+  const unit = e.deltaMode === 1 ? 33 : e.deltaMode === 2 ? 800 : 1;
+  const delta = Math.max(-ZOOM_MAX_EVENT, Math.min(ZOOM_MAX_EVENT, e.deltaY * unit));
+  zoomRemaining += delta * ZOOM_PER_PIXEL;
+}
+
+function easeZoom() {
+  if (Math.abs(zoomRemaining) < 1e-4) {
+    zoomRemaining = 0;
+    return;
+  }
+  const dt = Math.min(deltaTime, 100);
+  const step = zoomRemaining * (1 - Math.exp(-dt / ZOOM_EASE_MS));
+  zoomRemaining -= step;
+  p5.instance._renderer.states.curCamera._orbit(0, 0, step);
+}
+
 // orbitControl() pans on the right button only. With shift held, a left drag is
 // presented to it as a right drag, so shift+drag pans instead of rotating.
 function orbitOrPan() {
   const p = p5.instance;
+  p._mouseWheelDeltaY = 0; // wheel zoom is handled by easeZoom()
+  easeZoom();
   const real = p.mouseButton;
   if (p.mouseIsPressed && keyIsDown(SHIFT) && real && real.left) {
     p.mouseButton = { left: false, right: true, center: false };
@@ -1109,7 +1222,7 @@ function updateProgressBar(fraction) {
     progressTrack = document.createElement("div");
     progressTrack.style.cssText =
       "position:fixed;left:50%;bottom:24px;transform:translateX(-50%);" +
-      `width:${cfg.progressBarWidth}px;height:8px;border-radius:4px;` +
+      `width:${PROGRESS_BAR_WIDTH}px;height:8px;border-radius:4px;` +
       "background:rgba(128,128,128,0.3);overflow:hidden;pointer-events:none;";
     progressBar = document.createElement("div");
     progressBar.style.cssText =
@@ -1124,4 +1237,3 @@ function removeProgressBar() {
   if (progressTrack) progressTrack.remove();
   progressTrack = progressBar = null;
 }
-

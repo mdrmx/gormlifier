@@ -24,7 +24,6 @@ const common = {
   backgroundColour: 255,
   minAlpha: 0,
   walkerSize: 1,
-  progressBarWidth: 300,
 };
 const SPEC = [
   ["Orchid — Dense, Fine Trails", "orchid", 200000, 2, 30, 0.1, 255, 1.4],
@@ -93,12 +92,26 @@ class El {
   }
 }
 
-function loadSketch() {
+function fakeStorage(initial = {}) {
+  const data = { ...initial };
+  return {
+    data,
+    getItem: (k) => (k in data ? data[k] : null),
+    setItem: (k, v) => {
+      data[k] = String(v);
+    },
+  };
+}
+
+function loadSketch({ storage = fakeStorage(), answers = {} } = {}) {
   const body = new El("body");
   const ctx = vm.createContext({
     console,
     document: { createElement: (t) => new El(t), body },
     URL: { createObjectURL: (f) => `blob:${f.name}` },
+    window: { localStorage: storage },
+    prompt: () => answers.prompt,
+    confirm: () => answers.confirm ?? true,
   });
   for (const file of ["presets.js", "sketch.js"]) {
     vm.runInContext(fs.readFileSync(path.join(root, file), "utf8"), ctx, { filename: file });
@@ -109,10 +122,13 @@ function loadSketch() {
   return {
     run,
     json,
+    storage,
+    answers,
     inputs: run("inputs"),
     presetSelect: run("presetSelect"),
     renderButton: run("renderButton"),
     placeholder: () => run("presetPlaceholder"),
+    status: () => run("statusEl").textContent,
     // Values the next render would use.
     panel: () => json("readPanel(false)"),
     cfg: () => json("cfg"),
@@ -304,4 +320,124 @@ test("user presets can be appended without changing the UI code", () => {
   app.select("mine-1");
   assert.equal(app.panel().numWalkers, 42);
   assert.equal(app.presetSelect.value, "mine-1");
+});
+
+// ---- Save / overwrite / persistence ----
+
+test("progress bar width is no longer a setting", () => {
+  const app = loadSketch();
+  assert.ok(!PRESET_KEYS.includes("progressBarWidth"));
+  assert.ok(!("progressBarWidth" in app.inputs));
+  assert.ok(!("progressBarWidth" in app.panel()));
+});
+
+test("Save preset stores the panel as a new preset, selected and persisted", () => {
+  const app = loadSketch({ answers: { prompt: "  My look " } });
+  app.select("orchid-long-steps");
+  app.edit("stepSize", 77);
+  app.run("saveNewPreset()");
+  const saved = app.json("presets").find((p) => p.name === "My look");
+  assert.ok(saved);
+  assert.equal(saved.group, "My presets");
+  assert.equal(saved.settings.stepSize, 77);
+  assert.deepEqual(saved.settings, app.panel());
+  // Selected as an exact match, listed under its own group.
+  assert.equal(app.presetSelect.value, saved.id);
+  const groups = app.presetSelect.children.filter((c) => c.tagName === "optgroup");
+  assert.deepEqual(groups.map((g) => g.label), ["Orchid", "Female figure", "My presets"]);
+  // The original preset is untouched.
+  assert.equal(byName("Orchid — Long Steps").settings.stepSize, 40);
+  // It survives a reload.
+  const again = loadSketch({ storage: app.storage });
+  again.select(saved.id);
+  assert.deepEqual(again.panel(), saved.settings);
+});
+
+test("Save preset rejects empty, cancelled, duplicate and uploaded-model saves", () => {
+  const app = loadSketch({ answers: { prompt: "" } });
+  app.run("saveNewPreset()");
+  assert.equal(app.json("presets").length, 10);
+  app.answers.prompt = "orchid — long steps";
+  app.run("saveNewPreset()");
+  assert.equal(app.json("presets").length, 10);
+  assert.match(app.status(), /already exists/);
+  app.run("handleFiles")([{ name: "x.obj", type: "" }]);
+  app.answers.prompt = "Uploaded";
+  app.run("saveNewPreset()");
+  assert.equal(app.json("presets").length, 10);
+  assert.match(app.status(), /uploaded models/);
+});
+
+test("Overwrite preset replaces a built-in's settings and persists the change", () => {
+  const app = loadSketch();
+  const p = byName("Figure — Dense Cloud");
+  app.select(p.id);
+  app.edit("numWalkers", 1234);
+  app.edit("maxAlpha", 99);
+  assert.match(app.placeholder().textContent, /\(modified\)$/);
+  app.run("overwritePreset()");
+  const now = app.json("presets").find((x) => x.id === p.id);
+  assert.equal(now.settings.numWalkers, 1234);
+  assert.equal(now.settings.maxAlpha, 99);
+  // Now an exact match again, and other presets are untouched.
+  assert.equal(app.presetSelect.value, p.id);
+  assert.deepEqual(app.json("presets").find((x) => x.id === "figure-fine-diffusion").settings, { ...byName("Figure — Fine Diffusion").settings });
+  // The code-defined original is not mutated, but the override is what loads.
+  assert.equal(p.settings.numWalkers, 4000);
+  const again = loadSketch({ storage: app.storage });
+  again.select(p.id);
+  assert.equal(again.panel().numWalkers, 1234);
+  assert.equal(again.json("presets").length, 10);
+});
+
+test("Overwrite preset updates user presets and can be repeated", () => {
+  const app = loadSketch({ answers: { prompt: "Mine" } });
+  app.run("saveNewPreset()");
+  const id = app.presetSelect.value;
+  app.edit("stepSize", 5);
+  app.run("overwritePreset()");
+  app.edit("stepSize", 6);
+  app.run("overwritePreset()");
+  const mine = app.json("presets").filter((p) => p.id === id);
+  assert.equal(mine.length, 1);
+  assert.equal(mine[0].settings.stepSize, 6);
+  assert.equal(app.json("presetStore.user").length, 1);
+});
+
+test("Overwrite preset needs a selected preset and honours a cancelled confirm", () => {
+  const app = loadSketch();
+  app.edit("stepSize", 9);
+  app.run("overwritePreset()");
+  assert.match(app.status(), /Select a preset/);
+  assert.deepEqual(app.json("presetStore"), { overrides: {}, user: [] });
+  app.select("orchid-long-steps");
+  app.edit("stepSize", 9);
+  app.answers.confirm = false;
+  app.run("overwritePreset()");
+  assert.deepEqual(app.json("presetStore"), { overrides: {}, user: [] });
+});
+
+test("corrupt or outdated stored presets are ignored", () => {
+  const { PRESET_STORAGE_KEY } = presetsApi;
+  const good = { ...BUILTIN_PRESETS[0].settings, numWalkers: 5 };
+  const stale = { ...good };
+  delete stale.walkerSize; // missing a required key
+  const storage = fakeStorage({
+    [PRESET_STORAGE_KEY]: JSON.stringify({
+      overrides: { "orchid-long-steps": good, "figure-dense-cloud": stale },
+      user: [{ id: "u1", name: "Bad", settings: stale }, { id: "u2", name: "Ok", settings: { ...good, progressBarWidth: 300 } }],
+    }),
+  });
+  const app = loadSketch({ storage });
+  const list = app.json("presets");
+  assert.equal(list.find((p) => p.id === "orchid-long-steps").settings.numWalkers, 5);
+  assert.equal(list.find((p) => p.id === "figure-dense-cloud").settings.numWalkers, 4000);
+  assert.deepEqual(list.slice(10).map((p) => p.id), ["u2"]);
+  assert.ok(!("progressBarWidth" in list[10].settings));
+  // Unreadable JSON falls back to the built-ins.
+  const broken = loadSketch({ storage: fakeStorage({ [PRESET_STORAGE_KEY]: "{nope" }) });
+  assert.equal(broken.json("presets").length, 10);
+  // No storage at all also works.
+  const none = loadSketch({ storage: null });
+  assert.equal(none.json("presets").length, 10);
 });

@@ -26,7 +26,6 @@ const PRESET_KEYS = [
   "minAlpha",
   "fadeHeadroom",
   "walkerSize",
-  "progressBarWidth",
 ];
 
 // Values shared by all built-in presets.
@@ -38,7 +37,6 @@ const BUILTIN_COMMON = {
   backgroundColour: 255,
   minAlpha: 0,
   walkerSize: 1,
-  progressBarWidth: 300,
 };
 
 function builtinPreset(id, name, modelId, group, vary) {
@@ -100,11 +98,73 @@ function settingsMatch(values, preset) {
   return PRESET_KEYS.every((key) => values[key] === preset.settings[key]);
 }
 
+// Saved presets live in localStorage as { overrides, user }:
+//   overrides: { [builtinId]: settings } replaces a built-in preset's settings
+//   user:      [{ id, name, group, settings }] presets created by the user
+// Built-ins stay in code, so an override is the only thing stored for them.
+const PRESET_STORAGE_KEY = "random-walker-presets";
+const USER_GROUP = "My presets";
+
+function pickSettings(settings) {
+  const out = {};
+  for (const key of PRESET_KEYS) {
+    if (!settings || !(key in settings)) return null;
+    out[key] = settings[key];
+  }
+  return out;
+}
+
+// Reads the store, dropping anything malformed. Never throws (storage may be
+// missing or blocked).
+function readPresetStore(storage) {
+  const store = { overrides: {}, user: [] };
+  try {
+    const raw = JSON.parse(storage.getItem(PRESET_STORAGE_KEY));
+    for (const [id, s] of Object.entries(raw.overrides || {})) {
+      const settings = pickSettings(s);
+      if (settings) store.overrides[id] = settings;
+    }
+    for (const p of raw.user || []) {
+      const settings = pickSettings(p.settings);
+      const preset = { id: p.id, name: p.name, group: USER_GROUP, settings };
+      if (settings && !validatePreset(preset).length) store.user.push(preset);
+    }
+  } catch {
+    // No storage or unreadable data: start with an empty store.
+  }
+  return store;
+}
+
+// Returns false when the store could not be written (e.g. storage blocked).
+function writePresetStore(storage, store) {
+  try {
+    storage.setItem(PRESET_STORAGE_KEY, JSON.stringify(store));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// The full preset list: built-ins with any overrides applied, then user presets.
+function buildPresets(store) {
+  const builtins = BUILTIN_PRESETS.map((p) =>
+    store.overrides[p.id]
+      ? { ...p, settings: { ...store.overrides[p.id] } }
+      : p,
+  );
+  return [...builtins, ...store.user.map((p) => ({ ...p }))];
+}
+
 if (typeof module !== "undefined") {
   module.exports = {
     PRESET_KEYS,
     BUILTIN_PRESETS,
+    USER_GROUP,
+    PRESET_STORAGE_KEY,
     validatePreset,
     settingsMatch,
+    readPresetStore,
+    writePresetStore,
+    buildPresets,
   };
 }
