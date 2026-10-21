@@ -6,8 +6,9 @@
 //   3. Place a walker on each point; each takes `maxSteps` random steps,
 //      with a slight drift along the surface normal (away from the body).
 //   4. Trails fade in alpha with distance from their starting point.
-//   5. Each walk's segments are written straight into GPU buffers as it is
-//      walked, so the trails are drawn live and no bake step is needed.
+//   5. Each walk's segments are written into GPU buffers as it is walked, with
+//      no bake step. Once every walk is generated, the structure is grown on
+//      screen step by step, all walkers advancing together.
 //
 // All parameters live in the settings panel. Editing the panel changes
 // nothing on screen until the Render button is pressed: `cfg` (the settings
@@ -136,6 +137,12 @@ const SETTINGS = [
   },
   { group: "Appearance" },
   {
+    key: "animateGrowth",
+    label: "Animate growth",
+    type: "bool",
+    value: true,
+  },
+  {
     key: "maxAlpha",
     label: "Max alpha",
     type: "number",
@@ -184,8 +191,10 @@ let cfg = Object.fromEntries(fields.map((s) => [s.key, s.value]));
 let walkers = []; // one object per walker (see createWalkers)
 let cloud = null; // GPU-ready storage for every trail segment (see createCloud)
 let walkCursor = 0; // index of the next walker still to be walked
-let finished = false; // true once every walker has been walked
+let growth = 0; // steps of the finished walk revealed so far (fractional)
+let finished = false; // true once the walk is fully grown on screen
 const WALK_BUDGET_MS = 12; // walking time per frame, leaves room to draw at 30fps+
+const GROW_SECONDS = 4; // how long the whole walk takes to grow on screen
 let rendering = false; // true while render() is loading / sampling
 let progressTrack = null; // DOM elements of the loading bar
 let progressBar = null;
@@ -474,7 +483,7 @@ function settingsToSave() {
     setStatus("Presets can't use uploaded models");
     return null;
   }
-  return values;
+  return pickSettings(values); // playback options like animateGrowth stay out
 }
 
 // Stores `presetStore` and rebuilds the list. Returns false if storage failed
@@ -558,7 +567,7 @@ async function render() {
     const newWalkers = createWalkers(geom, next, tex);
     const newCloud = createCloud(
       drawingContext,
-      newWalkers.length * next.maxSteps,
+      newWalkers.length,
       next.maxSteps,
     );
 
@@ -568,6 +577,7 @@ async function render() {
     walkers = newWalkers;
     cloud = newCloud;
     walkCursor = 0;
+    growth = 0;
     finished = false;
     removeProgressBar();
     setPreview(geom, img, entry.label);
@@ -907,23 +917,25 @@ function readTexture(img, sampleSize) {
 // ---- Trail storage and walking ----
 // Each segment is one GPU instance of 14 floats: start xyz, end xyz, start
 // rgba and end rgba. Positions are stored unflipped; the shader flips y.
+// Segments are ordered step by step (index = step × walkers + walker), so all
+// the walkers' n-th steps sit together and can be revealed as one range.
 const SEGMENT_FLOATS = 14;
 
-// Allocates CPU and GPU storage for `totalSegments` segments.
-function createCloud(gl, totalSegments, maxSteps) {
-  const data = new Float32Array(totalSegments * SEGMENT_FLOATS);
+// Allocates CPU and GPU storage for `walkerCount × maxSteps` segments.
+function createCloud(gl, walkerCount, maxSteps) {
+  const data = new Float32Array(walkerCount * maxSteps * SEGMENT_FLOATS);
   const buffer = gl.createBuffer();
   gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
   gl.bufferData(gl.ARRAY_BUFFER, data.byteLength, gl.DYNAMIC_DRAW);
   gl.bindBuffer(gl.ARRAY_BUFFER, null);
-  return { data, buffer, maxSteps, uploaded: 0 };
+  return { data, buffer, walkerCount, maxSteps };
 }
 
 function freeCloud(gl, cloud) {
   gl.deleteBuffer(cloud.buffer);
 }
 
-// Walks one walker to completion, writing its segments into its slot in the
+// Walks one walker to completion, writing its segments into its column of the
 // cloud. The walk is one call, so its reach is final before colours are set.
 function walkInto(w, cloud, slot) {
   const d = cloud.data;
@@ -931,12 +943,13 @@ function walkInto(w, cloud, slot) {
   const s = cfg.stepSize;
   const push = s * cfg.outwardBias;
   const { ox, oy, oz, nx, ny, nz } = w;
+  const stride = cloud.walkerCount * SEGMENT_FLOATS;
   let x = ox,
     y = oy,
     z = oz;
   let reach = 0;
-  let o = slot * steps * SEGMENT_FLOATS;
-  for (let j = 0; j < steps; j++, o += SEGMENT_FLOATS) {
+  let o = slot * SEGMENT_FLOATS;
+  for (let j = 0; j < steps; j++, o += stride) {
     // Uniform random direction on the sphere, scaled to the step length...
     const dz = Math.random() * 2 - 1;
     const theta = Math.random() * TWO_PI;
@@ -957,19 +970,21 @@ function walkInto(w, cloud, slot) {
     y = py;
     z = pz;
   }
-  shadeSegments(w, d, slot * steps, steps, reach);
+  shadeSegments(w, d, slot, steps, cloud.walkerCount, reach);
 }
 
-// Sets colour and alpha at both ends of each segment. Alpha is maxAlpha at the
-// walker's origin, falling linearly to minAlpha at its fade distance (reach ×
-// fadeHeadroom), then holding there.
-function shadeSegments(w, d, firstSegment, count, reach) {
+// Sets colour and alpha at both ends of each of a walker's segments. Alpha is
+// maxAlpha at the walker's origin, falling linearly to minAlpha at its fade
+// distance (reach × fadeHeadroom), then holding there. `first` is the walker's
+// first segment and `stride` the number of segments between its steps.
+function shadeSegments(w, d, first, count, stride, reach) {
   const fade = Math.max(reach * cfg.fadeHeadroom, 1e-6);
   const lo = Math.min(cfg.minAlpha, cfg.maxAlpha);
   const [r, g, b] = w.colour.map((c) => c / 255);
   const { ox, oy, oz } = w;
-  let o = firstSegment * SEGMENT_FLOATS;
-  for (let j = 0; j < count; j++, o += SEGMENT_FLOATS) {
+  const step = stride * SEGMENT_FLOATS;
+  let o = first * SEGMENT_FLOATS;
+  for (let j = 0; j < count; j++, o += step) {
     const dStart = Math.hypot(d[o] - ox, d[o + 1] - oy, d[o + 2] - oz);
     const dEnd = Math.hypot(d[o + 3] - ox, d[o + 4] - oy, d[o + 5] - oz);
     const aStart = lerpAlpha(cfg.maxAlpha, lo, Math.min(dStart / fade, 1));
@@ -1004,10 +1019,13 @@ uniform mat4 uModelView;
 uniform mat4 uProjection;
 uniform vec2 uHalfViewport;
 uniform float uHalfWidth;
+uniform float uGrow; // 0-1: how far each segment in this draw has extended
 out vec4 vColour;
 void main() {
+  // A growing segment extends from its start towards its end.
+  vec3 end = mix(aStart, aEnd, uGrow);
   vec4 a = uProjection * uModelView * vec4(aStart * vec3(1.0, -1.0, 1.0), 1.0);
-  vec4 b = uProjection * uModelView * vec4(aEnd * vec3(1.0, -1.0, 1.0), 1.0);
+  vec4 b = uProjection * uModelView * vec4(end * vec3(1.0, -1.0, 1.0), 1.0);
   // Segment direction and its perpendicular, measured in pixels.
   vec2 dir = (b.xy / b.w - a.xy / a.w) * uHalfViewport;
   float len = length(dir);
@@ -1015,7 +1033,7 @@ void main() {
   vec4 p = mix(a, b, aCorner.x);
   vec2 offset = perp * aCorner.y * uHalfWidth / uHalfViewport;
   gl_Position = vec4(p.xy + offset * p.w, p.z, p.w);
-  vColour = mix(aColStart, aColEnd, aCorner.x);
+  vColour = mix(aColStart, aColEnd, aCorner.x * uGrow);
 }`;
 
 const TRAIL_FS = `#version 300 es
@@ -1076,33 +1094,32 @@ function trailRenderer(gl) {
     uProjection: uni("uProjection"),
     uHalfViewport: uni("uHalfViewport"),
     uHalfWidth: uni("uHalfWidth"),
+    uGrow: uni("uGrow"),
   };
   return trailGL;
 }
 
-// Copies the segments walked since the last call into the GPU buffer.
-function uploadWalked(cloud, walked) {
-  const end = walked * cloud.maxSteps;
-  if (end <= cloud.uploaded) return;
+// Copies every generated segment to the GPU buffer, in chunks to keep each
+// call a sensible size.
+function uploadCloud(cloud) {
   const gl = drawingContext;
-  const from = cloud.uploaded * SEGMENT_FLOATS;
+  const chunk = 4 * 1024 * 1024; // floats per call
   gl.bindBuffer(gl.ARRAY_BUFFER, cloud.buffer);
-  gl.bufferSubData(
-    gl.ARRAY_BUFFER,
-    from * 4,
-    cloud.data,
-    from,
-    (end - cloud.uploaded) * SEGMENT_FLOATS,
-  );
+  for (let from = 0; from < cloud.data.length; from += chunk) {
+    const count = Math.min(chunk, cloud.data.length - from);
+    gl.bufferSubData(gl.ARRAY_BUFFER, from * 4, cloud.data, from, count);
+  }
   gl.bindBuffer(gl.ARRAY_BUFFER, null);
-  cloud.uploaded = end;
 }
 
-// Draws every segment uploaded so far. The camera matrices are the same ones
-// p5 uses for its own geometry, so the trails orbit and zoom with the model.
-function drawCloud(cloud) {
-  const count = cloud.uploaded;
-  if (!count) return;
+// Draws the cloud grown to `growth` steps (0 to maxSteps, fractional). Whole
+// steps are drawn in full; the step in progress is drawn partly extended. The
+// camera matrices are the same ones p5 uses for its own geometry, so the
+// trails orbit and zoom with the model.
+function drawCloud(cloud, growth) {
+  const whole = Math.min(Math.floor(growth), cloud.maxSteps);
+  const partial = whole < cloud.maxSteps ? growth - whole : 0;
+  if (!whole && !partial) return;
   const gl = drawingContext;
   const r = trailRenderer(gl);
   const st = p5.instance._renderer.states;
@@ -1126,16 +1143,24 @@ function drawCloud(cloud) {
     [r.aColEnd, 4, 40],
   ];
   gl.bindBuffer(gl.ARRAY_BUFFER, cloud.buffer);
-  for (const [loc, size, offset] of instanced) {
-    gl.enableVertexAttribArray(loc);
-    gl.vertexAttribPointer(loc, size, gl.FLOAT, false, stride, offset);
-    gl.vertexAttribDivisor(loc, 1);
-  }
+  for (const [loc] of instanced) gl.enableVertexAttribArray(loc);
 
   gl.enable(gl.BLEND);
   gl.blendEquation(gl.FUNC_ADD);
   gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-  gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, count);
+
+  // Draws `count` segments from segment `first` (WebGL2 has no base instance,
+  // so the attribute pointers are offset instead).
+  const drawRange = (first, count, grow) => {
+    for (const [loc, size, offset] of instanced) {
+      gl.vertexAttribPointer(loc, size, gl.FLOAT, false, stride, offset + first * stride);
+      gl.vertexAttribDivisor(loc, 1);
+    }
+    gl.uniform1f(r.uGrow, grow);
+    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, count);
+  };
+  if (whole) drawRange(0, whole * cloud.walkerCount, 1);
+  if (partial) drawRange(whole * cloud.walkerCount, cloud.walkerCount, partial);
 
   // Put the attribute state back the way p5 left it.
   for (const [loc] of instanced) {
@@ -1195,23 +1220,36 @@ function draw() {
   // rotateY(frameCount * 0.003); // slow automatic turntable rotation
   if (!walkers.length) return; // model still loading
 
-  // Walk as many walkers as fit in the per-frame budget, then draw everything
-  // walked so far. The trails grow on screen while the walk runs.
+  // Phase 1: walk every walker (within the per-frame budget, so the page stays
+  // responsive) while the progress bar fills. Phase 2: grow the finished walk
+  // on screen one step at a time, so the structure builds up.
   if (!finished) {
-    const deadline = performance.now() + WALK_BUDGET_MS;
-    while (walkCursor < walkers.length && performance.now() < deadline) {
-      walkInto(walkers[walkCursor], cloud, walkCursor);
-      walkCursor++;
-    }
-    updateProgressBar(walkCursor / walkers.length);
-    if (walkCursor >= walkers.length) {
-      finished = true;
-      removeProgressBar();
-      if (!rendering) setStatus("Done");
+    if (walkCursor < walkers.length) {
+      const deadline = performance.now() + WALK_BUDGET_MS;
+      while (walkCursor < walkers.length && performance.now() < deadline) {
+        walkInto(walkers[walkCursor], cloud, walkCursor);
+        walkCursor++;
+      }
+      updateProgressBar(walkCursor / walkers.length);
+      if (walkCursor >= walkers.length) {
+        removeProgressBar();
+        uploadCloud(cloud);
+      }
+    } else {
+      // Clamp the frame time so a hitch doesn't skip part of the growth. With
+      // animation off the whole walk is shown at once.
+      const dt = Math.min(deltaTime, 100) / 1000;
+      growth = cfg.animateGrowth
+        ? growth + (dt * cfg.maxSteps) / GROW_SECONDS
+        : cfg.maxSteps;
+      if (growth >= cfg.maxSteps) {
+        growth = cfg.maxSteps;
+        finished = true;
+        if (!rendering) setStatus("Done");
+      }
     }
   }
-  uploadWalked(cloud, walkCursor);
-  drawCloud(cloud);
+  drawCloud(cloud, growth);
 }
 
 // ---- Progress bar ----

@@ -92,6 +92,9 @@ class El {
   }
 }
 
+// Playback options such as animateGrowth are panel settings but not part of a preset.
+const pickPresetKeys = (values) => Object.fromEntries(PRESET_KEYS.map((k) => [k, values[k]]));
+
 function fakeStorage(initial = {}) {
   const data = { ...initial };
   return {
@@ -130,7 +133,7 @@ function loadSketch({ storage = fakeStorage(), answers = {} } = {}) {
     placeholder: () => run("presetPlaceholder"),
     status: () => run("statusEl").textContent,
     // Values the next render would use.
-    panel: () => json("readPanel(false)"),
+    panel: () => pickPresetKeys(json("readPanel(false)")),
     cfg: () => json("cfg"),
     select(id) {
       const el = run("presetSelect");
@@ -181,7 +184,7 @@ test("preset values match the specification", () => {
 
 test("preset schema agrees with the SETTINGS schema in sketch.js", () => {
   const { json } = loadSketch();
-  const settings = json("SETTINGS.filter((s) => s.key)");
+  const settings = json("SETTINGS.filter((s) => s.key && s.key !== 'animateGrowth')");
   assert.deepEqual(settings.map((s) => s.key), PRESET_KEYS);
   const libraryIds = json("library.map((e) => e.id)");
   for (const p of BUILTIN_PRESETS) {
@@ -298,7 +301,7 @@ test("Reset to defaults restores the SETTINGS defaults", () => {
   const app = loadSketch();
   app.select("orchid-compact-cluster");
   app.run("resetToDefaults()");
-  const defaults = app.json("Object.fromEntries(fields.map((s) => [s.key, s.value]))");
+  const defaults = pickPresetKeys(app.json("Object.fromEntries(fields.map((s) => [s.key, s.value]))"));
   assert.deepEqual(app.panel(), defaults);
   assert.equal(app.presetSelect.value, "");
   assert.equal(app.placeholder().textContent, "Custom");
